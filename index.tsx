@@ -88,10 +88,10 @@ const App = () => {
           return;
         }
 
-        // Sample every 5 seconds, max 60 frames to fit context
-        let interval = 5; 
-        if (duration / interval > 60) {
-            interval = duration / 60;
+        // Sample every 1 second, max 800 frames to fit context
+        let interval = 1; 
+        if (duration / interval > 800) {
+            interval = duration / 800;
         }
 
         canvas.width = 480; // Resize for efficient token usage
@@ -232,7 +232,7 @@ const App = () => {
 
     // Call API
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview', // Capable of handling large context and reasoning
+      model: 'gemini-2.5-flash', // Capable of handling large context and reasoning
       contents: {
         parts: parts
       },
@@ -384,7 +384,7 @@ const App = () => {
                       PDF {match.pdfId}
                     </span>
                   </td>
-                  <td className="p-4 font-medium">Page {match.pageNumber}</td>
+                  <td className="p-4 font-medium">{match.pageNumber}</td>
                   <td className="p-4 font-semibold text-gray-800">{match.slideTitle}</td>
                   <td className="p-4">
                     <span className={`inline-block w-3 h-3 rounded-full mr-2 ${
