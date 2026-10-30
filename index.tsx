@@ -24,9 +24,31 @@ const SEEK_TIMEOUT_MS = 5000;
 const CANDIDATE_WIDTH = 768; // Fits in a single Gemini image tile while keeping slide text readable
 const BATCH_SIZE = 30; // Candidate frames per Gemini request
 
+// --- PDF decks ---
+const MAX_PDF_COUNT = 10; // Every batch re-sends all PDF pages, so keep the total reasonable
+const DECK_STYLES = [
+  { card: 'bg-red-50 border-red-100', label: 'text-red-900', badge: 'bg-red-100 text-red-800' },
+  { card: 'bg-green-50 border-green-100', label: 'text-green-900', badge: 'bg-green-100 text-green-800' },
+  { card: 'bg-amber-50 border-amber-100', label: 'text-amber-900', badge: 'bg-amber-100 text-amber-800' },
+  { card: 'bg-purple-50 border-purple-100', label: 'text-purple-900', badge: 'bg-purple-100 text-purple-800' },
+  { card: 'bg-teal-50 border-teal-100', label: 'text-teal-900', badge: 'bg-teal-100 text-teal-800' },
+  { card: 'bg-pink-50 border-pink-100', label: 'text-pink-900', badge: 'bg-pink-100 text-pink-800' },
+];
+const deckStyle = (index: number) => DECK_STYLES[index % DECK_STYLES.length];
+
 interface PdfImage {
   data: string; // Base64
   page: number;
+}
+
+interface PdfDeck {
+  name: string; // File name
+  pages: PdfImage[];
+}
+
+interface PdfSlot {
+  id: number; // Stable key so removing a slot does not shuffle the file inputs
+  file: File | null;
 }
 
 interface VideoSignatures {
@@ -67,6 +89,7 @@ interface SlideMatch {
   thumbnail: string; // Data URL of the candidate frame
   pdfThumbnail: string | null; // Data URL of the matched PDF page
   pdfId: number;
+  pdfName: string | null; // File name of the matched PDF, null if the model returned an unknown PDF
   pageNumber: number;
   slideTitle: string;
   reasoning: string;
@@ -359,11 +382,10 @@ const captureCandidateFrames = async (
 const buildResults = (
   frames: CandidateFrame[],
   matches: Map<string, ModelMatch>,
-  pdf1Images: PdfImage[],
-  pdf2Images: PdfImage[],
-  useHours: boolean
+  decks: PdfDeck[],
+  useHours: boolean,
+  enforceOrder: boolean
 ): { results: SlideMatch[]; nonSlideCount: number } => {
-  const isDual = pdf2Images.length > 0;
   const results: SlideMatch[] = [];
   let nonSlideCount = 0;
 
@@ -375,8 +397,8 @@ const buildResults = (
       continue;
     }
 
-    const pages = match.pdfId === 1 ? pdf1Images : match.pdfId === 2 && isDual ? pdf2Images : null;
-    const page = pages?.find(p => p.page === match.pageNumber);
+    const deck = decks[match.pdfId - 1] as PdfDeck | undefined;
+    const page = deck?.pages.find(p => p.page === match.pageNumber);
 
     // Merge consecutive events on the same page (non-slide frames in between do not break the run)
     const previous = results[results.length - 1];
@@ -396,10 +418,11 @@ const buildResults = (
       thumbnail: `data:image/jpeg;base64,${frame.data}`,
       pdfThumbnail: page ? `data:image/jpeg;base64,${page.data}` : null,
       pdfId: match.pdfId,
+      pdfName: deck?.name ?? null,
       pageNumber: match.pageNumber,
       slideTitle: match.slideTitle,
       reasoning: page ? match.reasoning
-        : match.pdfId === 2 && !isDual ? `${match.reasoning}（單份簡報模式不應出現 PDF 2，請人工確認）`
+        : !deck ? `${match.reasoning}（模型回傳的 PDF ${match.pdfId} 不存在，請人工確認）`
         : `${match.reasoning}（模型回傳的頁碼不存在，請人工確認）`,
       confidence: page ? match.confidence : 'Low',
       mergedCount: 1,
@@ -407,25 +430,29 @@ const buildResults = (
     });
   }
 
-  // Dual deck: PDF 1 -> PDF 2 switches exactly once. Pick the split point that violates the fewest
-  // events, then mark events on the wrong side of it as low confidence.
-  if (isDual && results.length > 0) {
-    let cost = results.filter(r => r.pdfId === 1).length; // Split at 0: every PDF 1 event is a violation
-    let bestCost = cost;
-    let bestSplit = 0;
-    for (let k = 1; k <= results.length; k++) {
-      cost += results[k - 1].pdfId === 2 ? 1 : -1;
-      if (cost < bestCost) {
-        bestCost = cost;
-        bestSplit = k;
+  // Ordered decks: PDF 1 -> PDF 2 -> ... -> PDF N, each deck shown as one contiguous run.
+  // Keep the longest non-decreasing run of PDF numbers and mark the remaining events as low
+  // confidence (with two decks this is the split point that violates the fewest events).
+  if (enforceOrder && decks.length > 1 && results.length > 0) {
+    const ids = results.map(r => r.pdfId);
+    const best = ids.map(() => 1);
+    const prev = ids.map(() => -1);
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = 0; j < i; j++) {
+        if (ids[j] <= ids[i] && best[j] + 1 > best[i]) {
+          best[i] = best[j] + 1;
+          prev[i] = j;
+        }
       }
     }
+    const keep = new Set<number>();
+    for (let k = best.indexOf(Math.max(...best)); k !== -1; k = prev[k]) keep.add(k);
+    const orderLabel = decks.map((_, i) => `PDF ${i + 1}`).join(' → ');
     results.forEach((r, idx) => {
-      const expected = idx < bestSplit ? 1 : 2;
-      if (r.pdfId !== expected) {
+      if (!keep.has(idx)) {
         r.flagged = true;
         r.confidence = 'Low';
-        r.reasoning += '（違反「PDF 1 → PDF 2 只切換一次」的順序，請人工確認）';
+        r.reasoning += `（違反「${orderLabel}」依序播放的順序，請人工確認）`;
       }
     });
   }
@@ -436,8 +463,10 @@ const buildResults = (
 const App = () => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [pdf1File, setPdf1File] = useState<File | null>(null);
-  const [pdf2File, setPdf2File] = useState<File | null>(null);
+  // Slot 0 is PDF 1 (required); further slots are optional and can be added or removed
+  const [pdfSlots, setPdfSlots] = useState<PdfSlot[]>([{ id: 1, file: null }, { id: 2, file: null }]);
+  const [enforceOrder, setEnforceOrder] = useState(true);
+  const nextSlotId = useRef(3);
   const [status, setStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<SlideMatch[]>([]);
@@ -445,6 +474,15 @@ const App = () => {
   const [threshold, setThreshold] = useState(DEFAULT_DIFF_THRESHOLD);
   const [signatures, setSignatures] = useState<VideoSignatures | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const pdf1File = pdfSlots[0].file;
+
+  const setSlotFile = (id: number, file: File | null) =>
+    setPdfSlots(slots => slots.map(s => (s.id === id ? { ...s, file } : s)));
+  const addSlot = () => {
+    const id = nextSlotId.current++;
+    setPdfSlots(slots => (slots.length >= MAX_PDF_COUNT ? slots : [...slots, { id, file: null }]));
+  };
+  const removeSlot = (id: number) => setPdfSlots(slots => slots.filter(s => s.id !== id));
 
   // Create a preview URL for the selected video and release it when the file changes
   useEffect(() => {
@@ -507,43 +545,35 @@ const App = () => {
   // --- Stage 2: Match one batch of candidate frames to PDF pages with Gemini ---
   const matchBatchWithGemini = async (
     ai: GoogleGenAI,
-    pdf1Images: PdfImage[],
-    pdf2Images: PdfImage[],
+    decks: PdfDeck[],
     batch: CandidateFrame[],
     useHours: boolean,
     previousSlide: string | null
   ): Promise<{ matches: ModelMatch[]; truncated: boolean }> => {
-    const isDual = pdf2Images.length > 0;
+    const deckCount = decks.length;
 
     // Construct Parts Array based on Requirements
     const parts: any[] = [];
 
-    // 1. PDF 1 Section
-    parts.push({ text: "【參考資料 A：第一份簡報 (PDF 1)】\n這是主要演講使用的投影片，依序出現：" });
-    pdf1Images.forEach(img => {
-      parts.push({
-        inlineData: {
-          mimeType: "image/jpeg",
-          data: img.data
-        }
-      });
-      parts.push({ text: `(PDF1 Page ${img.page})` });
-    });
-
-    // 2. PDF 2 Section (Optional)
-    // Dynamic Prompt Construction: Only add PDF 2 if images exist
-    if (isDual) {
-      parts.push({ text: "\n\n【參考資料 B：第二份簡報 (PDF 2)】\n這是演講下半場或補充使用的投影片，若有出現會接續在 PDF 1 之後：" });
-      pdf2Images.forEach(img => {
+    // 1. PDF Sections (PDF 1 is the main deck; any further decks are optional)
+    decks.forEach((deck, index) => {
+      const n = index + 1;
+      const description = index === 0
+        ? '這是主要演講使用的投影片，依序出現：'
+        : enforceOrder
+          ? `這是第 ${n} 份簡報，若有出現會接續在 PDF ${n - 1} 之後：`
+          : `這是第 ${n} 份簡報，可能在演講中任何時間出現：`;
+      parts.push({ text: `${index === 0 ? '' : '\n\n'}【參考資料：第 ${n} 份簡報 (PDF ${n})】\n${description}` });
+      deck.pages.forEach(img => {
         parts.push({
           inlineData: {
             mimeType: "image/jpeg",
             data: img.data
           }
         });
-        parts.push({ text: `(PDF2 Page ${img.page})` });
+        parts.push({ text: `(PDF${n} Page ${img.page})` });
       });
-    }
+    });
 
     // 3. Candidate Frames Section
     parts.push({ text: "\n\n【待比對目標：候選影格】\n以下是程式偵測到畫面切換後擷取的影格，依時間排序，每張附有編號與時間：" });
@@ -575,16 +605,18 @@ const App = () => {
 2.  **投影片畫面**：
     * 投影片可能因拍攝角度、講者遮擋、畫中畫縮小或畫質而不完整，請根據文字標題、圖表形狀、圖片排版判斷。
     * 若內容相似的頁面有多頁（例如逐步顯示的條列），請選擇與畫面**完全一致**的那一頁。
-    ${isDual ?
-      '* 演講順序是先展示 PDF 1，再展示 PDF 2，兩者之間只會切換一次。' :
-      '* 只有一份簡報，pdfId 固定為 1。若畫面中的投影片不屬於 PDF 1，請視為非投影片畫面。'}
+    ${deckCount === 1
+      ? '* 只有一份簡報，pdfId 固定為 1。若畫面中的投影片不屬於 PDF 1，請視為非投影片畫面。'
+      : enforceOrder
+        ? `* 演講依序展示 ${decks.map((_, i) => `PDF ${i + 1}`).join(' → ')}，每份簡報只會出現一段連續區間，切換到下一份後不會再回到前一份。`
+        : `* 共有 ${deckCount} 份簡報，出現順序不固定，可能交錯使用。`}
     ${previousSlide ? `* 前一批候選影格最後對應到的是 ${previousSlide}，可作為順序參考。` : ''}
 
 3.  **輸出格式 (JSON)**：
     請輸出一個 JSON 物件，包含一個 \`matches\` 陣列，**每一張候選影格都要有一筆**，依編號順序排列。
     * \`candidateId\`: 字串，候選影格編號（例如 "c12"）。
     * \`isSlide\`: 布林值，是否為投影片畫面。
-    * \`pdfId\`: 整數 (${isDual ? '1 或 2' : '固定為 1'})，非投影片時填 0。
+    * \`pdfId\`: 整數 (${deckCount === 1 ? '固定為 1' : `1 到 ${deckCount}`})，非投影片時填 0。
     * \`pageNumber\`: 整數，對應的 PDF 頁碼，非投影片時填 0。
     * \`slideTitle\`: 字串，投影片標題；若無標題請總結畫面核心內容，非投影片時簡述畫面（例如「講者特寫」）。
     * \`reasoning\`: 字串 (正體中文)，簡述判斷理由，請保持簡短。
@@ -651,23 +683,31 @@ const App = () => {
     setResults([]);
 
     try {
+      // Move empty optional slots to the end so the PDF numbers on screen match the results
+      const filledSlots = pdfSlots.filter(slot => slot.file);
+      const emptySlots = pdfSlots.filter(slot => !slot.file);
+      if (pdfSlots.some((slot, index) => slot.id !== filledSlots[index]?.id && index < filledSlots.length)) {
+        setPdfSlots([...filledSlots, ...emptySlots]);
+      }
+      const pdfFiles = filledSlots.map(slot => slot.file as File);
+
       // 1. Parallel Processing: PDF rendering and video sampling (reused if the video has not changed)
-      const pdf1Promise = extractPdfImages(pdf1File);
-      const pdf2Promise = pdf2File ? extractPdfImages(pdf2File) : Promise.resolve([]);
+      const decksPromise = Promise.all(pdfFiles.map(async (file, index) => {
+        const pages = await extractPdfImages(file);
+        if (pages.length === 0) {
+          throw new UserFacingError(`PDF ${index + 1}（${file.name}）轉換失敗：無法取得任何頁面，請確認檔案未損壞。`);
+        }
+        return { name: file.name, pages };
+      }));
       const signaturesPromise = currentSignatures
         ? Promise.resolve(currentSignatures)
         : sampleVideoSignatures(videoFile, (done, total) => setStatus(`第 1 段：取樣影格 ${done}/${total}...`));
 
-      const [pdf1Images, pdf2Images, videoSignatures] = await Promise.all([
-        pdf1Promise,
-        pdf2Promise,
+      const [decks, videoSignatures] = await Promise.all([
+        decksPromise,
         signaturesPromise
       ]);
       setSignatures(videoSignatures);
-
-      if (pdf1Images.length === 0) {
-        throw new UserFacingError("PDF 1 轉換失敗：無法取得任何頁面，請確認檔案未損壞。");
-      }
 
       // 2. Scene-change detection
       const useHours = videoSignatures.duration >= 3600;
@@ -696,7 +736,7 @@ const App = () => {
         const batch = queue[b];
         setStatus(`第 2 段：Gemini 比對第 ${b + 1}/${queue.length} 批（${batch.frames.length} 張候選影格）...`);
         const { matches: batchMatches } = await matchBatchWithGemini(
-          ai, pdf1Images, pdf2Images, batch.frames, useHours, batch.isRetry ? null : previousSlide
+          ai, decks, batch.frames, useHours, batch.isRetry ? null : previousSlide
         );
 
         const batchIds = new Set(batch.frames.map(f => f.id));
@@ -716,7 +756,7 @@ const App = () => {
       }
 
       // 4. Post-processing
-      const { results: finalResults, nonSlideCount } = buildResults(frames, matches, pdf1Images, pdf2Images, useHours);
+      const { results: finalResults, nonSlideCount } = buildResults(frames, matches, decks, useHours, enforceOrder);
       const unmatchedCount = frames.filter(f => !matches.has(f.id)).length;
       const flaggedCount = finalResults.filter(r => r.flagged).length;
 
@@ -742,7 +782,7 @@ const App = () => {
 
   return (
     <div className="p-8 max-w-6xl mx-auto font-sans">
-      <h1 className="text-3xl font-bold mb-6 text-gray-800">影片投影片分析工具（單份或雙份簡報）</h1>
+      <h1 className="text-3xl font-bold mb-6 text-gray-800">影片投影片分析工具（單份或多份簡報）</h1>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         <div className="p-4 bg-blue-50 rounded-lg border border-blue-100">
@@ -755,26 +795,58 @@ const App = () => {
           />
         </div>
 
-        <div className="p-4 bg-red-50 rounded-lg border border-red-100">
-          <label className="block text-sm font-semibold text-red-900 mb-2">PDF 1（主要簡報）</label>
-          <input
-            type="file"
-            accept="application/pdf"
-            onChange={(e) => setPdf1File(e.target.files?.[0] || null)}
-            className="w-full text-sm text-gray-700"
-          />
-        </div>
+        {pdfSlots.map((slot, index) => (
+          <div key={slot.id} className={`p-4 rounded-lg border ${deckStyle(index).card}`}>
+            <div className="flex items-start justify-between mb-2">
+              <label className={`block text-sm font-semibold ${deckStyle(index).label}`}>
+                PDF {index + 1}（{index === 0 ? '主要簡報' : '選填'}）
+              </label>
+              {index > 0 && (
+                <button
+                  onClick={() => removeSlot(slot.id)}
+                  disabled={isAnalyzing}
+                  title={`移除 PDF ${index + 1}`}
+                  className="text-gray-400 hover:text-red-600 disabled:cursor-not-allowed text-sm leading-none"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+            <input
+              type="file"
+              accept="application/pdf"
+              onChange={(e) => setSlotFile(slot.id, e.target.files?.[0] || null)}
+              className="w-full text-sm text-gray-700"
+            />
+          </div>
+        ))}
 
-        <div className="p-4 bg-green-50 rounded-lg border border-green-100">
-          <label className="block text-sm font-semibold text-green-900 mb-2">PDF 2（選填）</label>
-          <input
-            type="file"
-            accept="application/pdf"
-            onChange={(e) => setPdf2File(e.target.files?.[0] || null)}
-            className="w-full text-sm text-gray-700"
-          />
-        </div>
+        {pdfSlots.length < MAX_PDF_COUNT && (
+          <button
+            onClick={addSlot}
+            disabled={isAnalyzing}
+            className="p-4 rounded-lg border-2 border-dashed border-gray-300 text-gray-500 hover:border-indigo-400 hover:text-indigo-600 disabled:cursor-not-allowed font-semibold"
+          >
+            ＋ 新增 PDF
+          </button>
+        )}
       </div>
+
+      {pdfSlots.length > 1 && (
+        <label className="mb-6 flex items-start gap-2 text-sm text-gray-700">
+          <input
+            type="checkbox"
+            checked={enforceOrder}
+            disabled={isAnalyzing}
+            onChange={(e) => setEnforceOrder(e.target.checked)}
+            className="mt-1"
+          />
+          <span>
+            簡報依上傳順序播放（PDF 1 → PDF 2 → …，每份只出現一段，不會回頭）。
+            <span className="text-gray-500">勾選時，違反順序的項目會標為低信心；若多份簡報會交錯使用，請取消勾選。</span>
+          </span>
+        </label>
+      )}
 
       <div className="mb-8 p-4 bg-gray-50 rounded-lg border border-gray-200">
         <label htmlFor="threshold" className="flex justify-between text-sm font-semibold text-gray-800 mb-2">
@@ -885,10 +957,13 @@ const App = () => {
                   </td>
                   <td className="p-4">
                     <span className={`px-2 py-1 rounded text-xs font-bold whitespace-nowrap ${
-                      match.pdfId === 1 ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'
+                      match.pdfName ? deckStyle(match.pdfId - 1).badge : 'bg-gray-100 text-gray-600'
                     }`}>
                       PDF {match.pdfId}
                     </span>
+                    {match.pdfName && (
+                      <span className="block mt-1 text-xs text-gray-500 break-all max-w-[8rem]">{match.pdfName}</span>
+                    )}
                   </td>
                   <td className="p-4 font-medium">{match.pageNumber}</td>
                   <td className="p-4 font-semibold text-gray-800">{match.slideTitle}</td>
