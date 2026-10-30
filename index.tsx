@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Type } from "@google/genai";
 import * as pdfjsLib from 'pdfjs-dist';
@@ -7,37 +7,79 @@ import * as pdfjsLib from 'pdfjs-dist';
 // Using esm.sh for the worker ensures version compatibility with the library imported from esm.sh
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://esm.sh/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
 
-interface SlideMatch {
-  timestamp: string;
-  seconds: number; // Corrected time in seconds, used for jumping in the video player
-  pdfId: number;
-  pageNumber: number;
-  slideTitle: string; // New field
-  reasoning: string;
-  confidence: "High" | "Medium" | "Low";
-}
+// --- Stage 1: Scene-change detection settings ---
+const SAMPLE_INTERVAL_SEC = 1; // Sample roughly every second
+const MAX_SAMPLES = 7200; // Long videos sample more sparsely to keep this many samples at most
+const SIGNATURE_WIDTH = 64; // Small grayscale signature used for frame differencing
+const SIGNATURE_HEIGHT = 36;
+const DEFAULT_DIFF_THRESHOLD = 5; // Mean absolute pixel difference (% of 255) that counts as a slide change
+const MIN_DIFF_THRESHOLD = 1;
+const MAX_DIFF_THRESHOLD = 30;
+const STABLE_THRESHOLD = 1.5; // Consecutive frames differing less than this (%) are considered settled
+const MAX_SETTLE_SAMPLES = 5; // Give up waiting for the picture to settle after this many samples
+const MAX_CANDIDATES = 600; // Refuse to send more candidates than this (raise the threshold instead)
+const SEEK_TIMEOUT_MS = 5000;
+
+// --- Stage 2: Gemini matching settings ---
+const CANDIDATE_WIDTH = 768; // Fits in a single Gemini image tile while keeping slide text readable
+const BATCH_SIZE = 30; // Candidate frames per Gemini request
 
 interface PdfImage {
   data: string; // Base64
   page: number;
 }
 
-interface VideoFrame {
-  data: string; // Base64
-  time: number; // Seconds
-  timestamp: string;
+interface VideoSignatures {
+  file: File;
+  duration: number;
+  interval: number;
+  times: number[]; // Sample times in seconds
+  sigs: Uint8Array[]; // Grayscale SIGNATURE_WIDTH x SIGNATURE_HEIGHT pixels per sample
 }
 
-interface VideoFrameResult {
-  frames: VideoFrame[];
-  interval: number; // Sampling interval in seconds
-  useHours: boolean; // Video is 1 hour or longer -> HH:MM:SS
+interface Candidate {
+  id: string;
+  seconds: number; // Detected change time (midpoint between the previous and changed sample)
+  frameSeconds: number; // Time of the settled representative frame
+}
+
+interface CandidateFrame extends Candidate {
+  data: string; // Base64 JPEG of the representative frame
+}
+
+interface ModelMatch {
+  candidateId: string;
+  isSlide: boolean;
+  pdfId: number;
+  pageNumber: number;
+  slideTitle: string;
+  reasoning: string;
+  confidence: Confidence;
+}
+
+type Confidence = "High" | "Medium" | "Low";
+
+interface SlideMatch {
+  timestamp: string;
+  seconds: number; // Program-detected change time, used for jumping in the video player
+  frameTimestamp: string;
+  frameSeconds: number;
+  thumbnail: string; // Data URL of the candidate frame
+  pdfThumbnail: string | null; // Data URL of the matched PDF page
+  pdfId: number;
+  pageNumber: number;
+  slideTitle: string;
+  reasoning: string;
+  confidence: Confidence;
+  mergedCount: number; // Number of candidate frames merged into this event
+  flagged: boolean; // Failed a consistency check, needs manual review
 }
 
 // Errors with a message that is already user-facing (Traditional Chinese) and should be shown as-is
 class UserFacingError extends Error {}
 
 const CONFIDENCE_LABELS: Record<string, string> = { High: '高', Medium: '中', Low: '低' };
+const CONFIDENCE_RANK: Record<string, number> = { Low: 0, Medium: 1, High: 2 };
 
 // --- Helper: Time formatting (MM:SS, or HH:MM:SS for videos of 1 hour or longer) ---
 const formatTime = (seconds: number, useHours: boolean): string => {
@@ -48,34 +90,20 @@ const formatTime = (seconds: number, useHours: boolean): string => {
   return useHours ? `${hh}:${mm}:${ss}` : `${mm}:${ss}`;
 };
 
-// --- Helper: Parse MM:SS or HH:MM:SS into seconds (NaN if invalid) ---
-const parseTimeToSeconds = (timeStr: string): number => {
-  if (!timeStr) return NaN;
-  const parts = timeStr.trim().split(':').map(part => Number(part.trim()));
-  if (parts.some(p => !Number.isFinite(p))) return NaN;
-
-  if (parts.length === 2) {
-    return parts[0] * 60 + parts[1];
-  } else if (parts.length === 3) {
-    return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  }
-  return NaN;
-};
-
 // --- Helper: Parse model JSON, repairing truncated output by dropping the last incomplete item ---
-const parseTransitionsJson = (text: string): { transitions: any[]; truncated: boolean } => {
+const parseJsonArrayField = (text: string, field: string): { items: any[]; truncated: boolean } => {
   let cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
   const jsonStart = cleanText.indexOf('{');
   if (jsonStart > 0) cleanText = cleanText.substring(jsonStart);
 
   try {
     const json = JSON.parse(cleanText);
-    return { transitions: Array.isArray(json.transitions) ? json.transitions : [], truncated: false };
+    return { items: Array.isArray(json[field]) ? json[field] : [], truncated: false };
   } catch {
     // Fall through to truncation repair
   }
 
-  // Expected structure: { "transitions": [ {...}, {...}, ... ]
+  // Expected structure: { "<field>": [ {...}, {...}, ... ]
   // Scan while tracking strings and nesting depth to find the end of the last complete item
   // (an item's closing brace brings depth back to 2: root object -> array).
   let depth = 0;
@@ -99,9 +127,9 @@ const parseTransitionsJson = (text: string): { transitions: any[]; truncated: bo
   }
 
   if (lastCompleteItemEnd === -1) {
-    if (cleanText.includes('"transitions"')) {
-      console.warn("Response truncated before any complete transition. Returning empty list.");
-      return { transitions: [], truncated: true };
+    if (cleanText.includes(`"${field}"`)) {
+      console.warn("Response truncated before any complete item. Returning empty list.");
+      return { items: [], truncated: true };
     }
     throw new UserFacingError("無法解析分析結果：模型回應不是有效的 JSON 格式。");
   }
@@ -110,7 +138,7 @@ const parseTransitionsJson = (text: string): { transitions: any[]; truncated: bo
   try {
     const json = JSON.parse(repaired);
     console.warn("Response appeared truncated. Discarded the last incomplete item.");
-    return { transitions: Array.isArray(json.transitions) ? json.transitions : [], truncated: true };
+    return { items: Array.isArray(json[field]) ? json[field] : [], truncated: true };
   } catch {
     throw new UserFacingError("無法解析分析結果：模型回應被截斷且無法修復。");
   }
@@ -124,10 +152,10 @@ const toErrorMessage = (error: unknown): string => {
   const status = typeof (error as any)?.status === 'number' ? (error as any).status : undefined;
 
   if (status === 413 || /\b413\b|too large|payload size|exceeds the limit/i.test(msg)) {
-    return "檔案過大：送出的影格與投影片總量超過 API 請求大小上限。請縮短影片、減少 PDF 頁數或壓縮檔案後再試。";
+    return "檔案過大：送出的影格與投影片總量超過 API 請求大小上限。請減少 PDF 頁數或壓縮檔案後再試。";
   }
   if (status === 400 || /\b400\b|INVALID_ARGUMENT/.test(msg)) {
-    return `請求失敗 (400)：輸入內容可能超出模型 token 上限。請縮短影片或減少 PDF 頁數後再試。\n原始訊息：${msg}`;
+    return `請求失敗 (400)：輸入內容可能超出模型 token 上限。請減少 PDF 頁數後再試。\n原始訊息：${msg}`;
   }
   if (status === 401 || status === 403 || /API key|PERMISSION_DENIED/i.test(msg)) {
     return `API 金鑰無效或沒有權限，請檢查 AI Studio 的 API Key 設定。\n原始訊息：${msg}`;
@@ -141,6 +169,270 @@ const toErrorMessage = (error: unknown): string => {
   return `分析過程中發生未預期的錯誤：${msg}`;
 };
 
+// --- Helper: Video loading and seeking ---
+const loadVideo = (file: File): Promise<HTMLVideoElement> => {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.preload = 'auto';
+    video.muted = true;
+    video.playsInline = true;
+    video.src = URL.createObjectURL(file);
+
+    video.onloadeddata = () => {
+      if (!Number.isFinite(video.duration) || video.duration <= 0 || !video.videoWidth) {
+        URL.revokeObjectURL(video.src);
+        reject(new UserFacingError("影格抽取失敗：無法讀取影片長度或畫面尺寸，請確認影片檔案完整。"));
+        return;
+      }
+      resolve(video);
+    };
+    video.onerror = () => {
+      URL.revokeObjectURL(video.src);
+      reject(new UserFacingError("影格抽取失敗：瀏覽器無法載入這支影片。請確認格式為瀏覽器可播放的 MP4/WebM，且檔案未損壞。"));
+    };
+  });
+};
+
+const releaseVideo = (video: HTMLVideoElement) => {
+  URL.revokeObjectURL(video.src);
+  video.removeAttribute('src');
+  video.load();
+};
+
+// Resolves true once the video has seeked, false on timeout
+const seekTo = (video: HTMLVideoElement, time: number): Promise<boolean> => {
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      video.removeEventListener('seeked', onSeeked);
+    };
+    const onSeeked = () => {
+      cleanup();
+      resolve(true);
+    };
+    const timer = window.setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, SEEK_TIMEOUT_MS);
+    video.addEventListener('seeked', onSeeked);
+    video.currentTime = time;
+  });
+};
+
+// --- Stage 1a: Sample the video into small grayscale signatures ---
+const sampleVideoSignatures = async (
+  file: File,
+  onProgress: (done: number, total: number) => void
+): Promise<VideoSignatures> => {
+  const video = await loadVideo(file);
+  try {
+    const duration = video.duration;
+    const interval = Math.max(SAMPLE_INTERVAL_SEC, duration / MAX_SAMPLES);
+    const total = Math.ceil(duration / interval);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = SIGNATURE_WIDTH;
+    canvas.height = SIGNATURE_HEIGHT;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new UserFacingError("影格抽取失敗：瀏覽器不支援 Canvas。");
+
+    const times: number[] = [];
+    const sigs: Uint8Array[] = [];
+    for (let n = 0; n < total; n++) {
+      const time = n * interval;
+      if (!(await seekTo(video, time))) {
+        console.warn(`Seek to ${time}s timed out, skipping sample`);
+        continue;
+      }
+      ctx.drawImage(video, 0, 0, SIGNATURE_WIDTH, SIGNATURE_HEIGHT);
+      const rgba = ctx.getImageData(0, 0, SIGNATURE_WIDTH, SIGNATURE_HEIGHT).data;
+      const gray = new Uint8Array(SIGNATURE_WIDTH * SIGNATURE_HEIGHT);
+      for (let p = 0; p < gray.length; p++) {
+        gray[p] = 0.299 * rgba[p * 4] + 0.587 * rgba[p * 4 + 1] + 0.114 * rgba[p * 4 + 2];
+      }
+      times.push(time);
+      sigs.push(gray);
+      if (n % 10 === 0) onProgress(n + 1, total);
+    }
+
+    if (sigs.length === 0) {
+      throw new UserFacingError("影格抽取失敗：無法從影片取得任何畫面。請確認影片格式為瀏覽器可播放的 MP4/WebM，且檔案未損壞。");
+    }
+    return { file, duration, interval, times, sigs };
+  } finally {
+    releaseVideo(video);
+  }
+};
+
+// Mean absolute pixel difference as a percentage of the full 0-255 range
+const frameDiff = (a: Uint8Array, b: Uint8Array): number => {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+  return (sum / a.length / 255) * 100;
+};
+
+// --- Stage 1b: Find candidate slide changes ---
+// A change is detected when a sample differs from the last representative frame by more than the
+// threshold (comparing against the representative rather than the previous sample also catches slow
+// fades). The representative is the first sample after the change whose next sample is nearly identical.
+const detectCandidates = (signatures: VideoSignatures, threshold: number): Candidate[] => {
+  const { sigs, times, interval } = signatures;
+  if (sigs.length === 0) return [];
+  const stable = Math.min(STABLE_THRESHOLD, threshold / 2);
+  const last = sigs.length - 1;
+
+  const settle = (start: number): number => {
+    const limit = Math.min(start + MAX_SETTLE_SAMPLES, last);
+    for (let j = start; j < limit; j++) {
+      if (frameDiff(sigs[j], sigs[j + 1]) <= stable) return j;
+    }
+    return limit;
+  };
+
+  const candidates: Candidate[] = [];
+  const addCandidate = (changeIndex: number, frameIndex: number) => {
+    // The change may have been triggered by motion before the new picture arrived (e.g. a moving
+    // speaker shot followed by a slide), so the onset is the earliest sample already matching the
+    // representative frame.
+    let onset = frameIndex;
+    while (onset > changeIndex && frameDiff(sigs[onset - 1], sigs[frameIndex]) <= threshold) onset--;
+    candidates.push({
+      id: `c${candidates.length + 1}`,
+      seconds: onset === 0 ? 0 : Math.max(0, times[onset] - interval / 2),
+      frameSeconds: times[frameIndex],
+    });
+  };
+
+  let rep = settle(0);
+  addCandidate(0, rep);
+  let reference = sigs[rep];
+
+  let i = rep + 1;
+  while (i <= last) {
+    if (frameDiff(sigs[i], reference) > threshold) {
+      rep = settle(i);
+      // Skip brief flashes that return to the previous picture
+      if (frameDiff(sigs[rep], reference) > threshold) {
+        addCandidate(i, rep);
+        reference = sigs[rep];
+      }
+      i = rep + 1;
+    } else {
+      i++;
+    }
+  }
+  return candidates;
+};
+
+// --- Stage 1c: Capture representative frames for the candidates ---
+const captureCandidateFrames = async (
+  file: File,
+  candidates: Candidate[],
+  onProgress: (done: number, total: number) => void
+): Promise<CandidateFrame[]> => {
+  const video = await loadVideo(file);
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = CANDIDATE_WIDTH;
+    canvas.height = Math.round(CANDIDATE_WIDTH * video.videoHeight / video.videoWidth);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new UserFacingError("影格抽取失敗：瀏覽器不支援 Canvas。");
+
+    const frames: CandidateFrame[] = [];
+    for (let n = 0; n < candidates.length; n++) {
+      const candidate = candidates[n];
+      if (!(await seekTo(video, candidate.frameSeconds))) {
+        console.warn(`Seek to ${candidate.frameSeconds}s timed out, dropping candidate ${candidate.id}`);
+        continue;
+      }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      frames.push({ ...candidate, data: canvas.toDataURL('image/jpeg', 0.7).split(',')[1] });
+      onProgress(n + 1, candidates.length);
+    }
+    return frames;
+  } finally {
+    releaseVideo(video);
+  }
+};
+
+// --- Stage 3: Post-processing ---
+const buildResults = (
+  frames: CandidateFrame[],
+  matches: Map<string, ModelMatch>,
+  pdf1Images: PdfImage[],
+  pdf2Images: PdfImage[],
+  useHours: boolean
+): { results: SlideMatch[]; nonSlideCount: number } => {
+  const isDual = pdf2Images.length > 0;
+  const results: SlideMatch[] = [];
+  let nonSlideCount = 0;
+
+  for (const frame of frames) {
+    const match = matches.get(frame.id);
+    if (!match) continue;
+    if (!match.isSlide) {
+      nonSlideCount++;
+      continue;
+    }
+
+    const pages = match.pdfId === 1 ? pdf1Images : match.pdfId === 2 && isDual ? pdf2Images : null;
+    const page = pages?.find(p => p.page === match.pageNumber);
+
+    // Merge consecutive events on the same page (non-slide frames in between do not break the run)
+    const previous = results[results.length - 1];
+    if (previous && previous.pdfId === match.pdfId && previous.pageNumber === match.pageNumber) {
+      previous.mergedCount++;
+      if (!previous.flagged && CONFIDENCE_RANK[match.confidence] > CONFIDENCE_RANK[previous.confidence]) {
+        previous.confidence = match.confidence;
+      }
+      continue;
+    }
+
+    results.push({
+      timestamp: formatTime(frame.seconds, useHours),
+      seconds: frame.seconds,
+      frameTimestamp: formatTime(frame.frameSeconds, useHours),
+      frameSeconds: frame.frameSeconds,
+      thumbnail: `data:image/jpeg;base64,${frame.data}`,
+      pdfThumbnail: page ? `data:image/jpeg;base64,${page.data}` : null,
+      pdfId: match.pdfId,
+      pageNumber: match.pageNumber,
+      slideTitle: match.slideTitle,
+      reasoning: page ? match.reasoning
+        : match.pdfId === 2 && !isDual ? `${match.reasoning}（單份簡報模式不應出現 PDF 2，請人工確認）`
+        : `${match.reasoning}（模型回傳的頁碼不存在，請人工確認）`,
+      confidence: page ? match.confidence : 'Low',
+      mergedCount: 1,
+      flagged: !page,
+    });
+  }
+
+  // Dual deck: PDF 1 -> PDF 2 switches exactly once. Pick the split point that violates the fewest
+  // events, then mark events on the wrong side of it as low confidence.
+  if (isDual && results.length > 0) {
+    let cost = results.filter(r => r.pdfId === 1).length; // Split at 0: every PDF 1 event is a violation
+    let bestCost = cost;
+    let bestSplit = 0;
+    for (let k = 1; k <= results.length; k++) {
+      cost += results[k - 1].pdfId === 2 ? 1 : -1;
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestSplit = k;
+      }
+    }
+    results.forEach((r, idx) => {
+      const expected = idx < bestSplit ? 1 : 2;
+      if (r.pdfId !== expected) {
+        r.flagged = true;
+        r.confidence = 'Low';
+        r.reasoning += '（違反「PDF 1 → PDF 2 只切換一次」的順序，請人工確認）';
+      }
+    });
+  }
+
+  return { results, nonSlideCount };
+};
+
 const App = () => {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -150,6 +442,8 @@ const App = () => {
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<SlideMatch[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [threshold, setThreshold] = useState(DEFAULT_DIFF_THRESHOLD);
+  const [signatures, setSignatures] = useState<VideoSignatures | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   // Create a preview URL for the selected video and release it when the file changes
@@ -162,6 +456,13 @@ const App = () => {
     setVideoUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [videoFile]);
+
+  // Signatures are only valid for the video they were sampled from
+  const currentSignatures = signatures && signatures.file === videoFile ? signatures : null;
+  const candidateCount = useMemo(
+    () => (currentSignatures ? detectCandidates(currentSignatures, threshold).length : null),
+    [currentSignatures, threshold]
+  );
 
   const jumpToTime = (seconds: number) => {
     const video = videoRef.current;
@@ -203,91 +504,16 @@ const App = () => {
     return images;
   };
 
-  // --- Helper: Extract Frames from Video ---
-  const extractVideoFrames = async (file: File): Promise<VideoFrameResult> => {
-    return new Promise((resolve) => {
-      const video = document.createElement('video');
-      video.preload = 'metadata';
-      video.src = URL.createObjectURL(file);
-      video.muted = true;
-
-      const frames: VideoFrame[] = [];
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-
-      video.onloadedmetadata = async () => {
-        const duration = video.duration;
-
-        // Validation: Check if duration is valid and finite
-        if (!Number.isFinite(duration) || duration <= 0) {
-          console.warn("Invalid video duration:", duration);
-          URL.revokeObjectURL(video.src);
-          resolve({ frames: [], interval: 0, useHours: false });
-          return;
-        }
-
-        const useHours = duration >= 3600;
-
-        // Sample every 1 second, max 800 frames to fit context
-        let interval = 1;
-        if (duration / interval > 800) {
-            interval = duration / 800;
-        }
-
-        canvas.width = 480; // Resize for efficient token usage
-        canvas.height = 270;
-
-        for (let time = 0; time < duration; time += interval) {
-          await new Promise<void>((r) => {
-            // Safety check: Ensure currentTime doesn't exceed duration
-            if (time > duration) {
-               r();
-               return;
-            }
-
-            video.currentTime = time;
-
-            video.onseeked = () => {
-              if (ctx) {
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                frames.push({
-                  data: canvas.toDataURL('image/jpeg', 0.7).split(',')[1],
-                  time,
-                  timestamp: formatTime(time, useHours),
-                });
-              }
-              r();
-            };
-
-            // Handle seek errors
-            video.onerror = () => {
-                console.warn(`Error seeking to ${time}s`);
-                r();
-            };
-          });
-        }
-        URL.revokeObjectURL(video.src);
-        resolve({ frames, interval, useHours });
-      };
-
-      // Handle general video load errors
-      video.onerror = () => {
-          console.error("Failed to load video metadata");
-          URL.revokeObjectURL(video.src);
-          resolve({ frames: [], interval: 0, useHours: false });
-      };
-    });
-  };
-
-  // --- Core: Analyze with Gemini ---
-  const analyzeWithGemini = async (
+  // --- Stage 2: Match one batch of candidate frames to PDF pages with Gemini ---
+  const matchBatchWithGemini = async (
+    ai: GoogleGenAI,
     pdf1Images: PdfImage[],
     pdf2Images: PdfImage[],
-    video: VideoFrameResult
-  ): Promise<{ transitions: SlideMatch[]; truncated: boolean }> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const { frames: videoFrames, interval, useHours } = video;
-    const timeFormatLabel = useHours ? 'HH:MM:SS' : 'MM:SS';
+    batch: CandidateFrame[],
+    useHours: boolean,
+    previousSlide: string | null
+  ): Promise<{ matches: ModelMatch[]; truncated: boolean }> => {
+    const isDual = pdf2Images.length > 0;
 
     // Construct Parts Array based on Requirements
     const parts: any[] = [];
@@ -306,7 +532,7 @@ const App = () => {
 
     // 2. PDF 2 Section (Optional)
     // Dynamic Prompt Construction: Only add PDF 2 if images exist
-    if (pdf2Images.length > 0) {
+    if (isDual) {
       parts.push({ text: "\n\n【參考資料 B：第二份簡報 (PDF 2)】\n這是演講下半場或補充使用的投影片，若有出現會接續在 PDF 1 之後：" });
       pdf2Images.forEach(img => {
         parts.push({
@@ -319,10 +545,10 @@ const App = () => {
       });
     }
 
-    // 3. Video Frames Section
-    parts.push({ text: "\n\n【待分析目標：影片影格序列】\n以下是從演講影片中按時間順序取樣的畫面 (帶有時間戳記)：" });
-    videoFrames.forEach(frame => {
-      parts.push({ text: `\n[VIDEO_TIMESTAMP: ${frame.timestamp}]` });
+    // 3. Candidate Frames Section
+    parts.push({ text: "\n\n【待比對目標：候選影格】\n以下是程式偵測到畫面切換後擷取的影格，依時間排序，每張附有編號與時間：" });
+    batch.forEach(frame => {
+      parts.push({ text: `\n[CANDIDATE_ID: ${frame.id}｜時間 ${formatTime(frame.frameSeconds, useHours)}]` });
       parts.push({
         inlineData: {
           mimeType: "image/jpeg",
@@ -334,38 +560,34 @@ const App = () => {
     // 4. System Prompt (Appended at the end)
     const systemPrompt = `
 """
-你是一位專業的演講影片分析專家，擅長將「現場演講影片」與「原始 PDF 投影片」進行視覺同步。
+你是一位專業的演講影片分析專家，擅長將「現場演講影片」的畫面與「原始 PDF 投影片」進行視覺比對。
 
 **任務目標：**
-分析提供的【影片影格序列】，找出每一張投影片（來自 PDF 1${pdf2Images.length > 0 ? ' 或 PDF 2' : ''}）在影片中「首次清晰出現」的時間點。
+針對每一張【候選影格】，判斷它顯示的是哪一份 PDF 的第幾頁，或是「非投影片畫面」。
+時間由程式決定，你只需要回答對應關係，不需要判斷時間。
 
-**核心分析邏輯與規則 (請嚴格遵守)：**
+**比對規則 (請嚴格遵守)：**
 
-1.  **忽略非投影片畫面 (抗干擾)**：
-    * 影片開頭通常包含主持人介紹、講者特寫或等待畫面。請務必等到**投影片內容清晰充滿畫面**，且與 PDF 某頁高度相符時，才標記第一個事件。
-    * **切勿強行從 ${formatTime(0, useHours)} 開始**，除非 ${formatTime(0, useHours)} 確實就是投影片畫面。
-    * 若畫面中只有講者、觀眾或過場動畫，請**忽略**該影格，不要強行匹配。
+1.  **非投影片畫面**：
+    * 主持人介紹、講者特寫、觀眾、等待畫面、過場動畫、黑畫面等，若畫面中**看不到可辨識的投影片內容**，請將 \`isSlide\` 設為 false。
+    * 不要強行匹配：只有在投影片內容與某頁明確相符時才設為 true。
 
-2.  **${pdf2Images.length > 0 ? '雙份簡報切換邏輯 (PDF 1 -> PDF 2)' : '單份簡報分析邏輯'}**：
-    * 影片內容是連續的。順序必然是：先展示 PDF 1 的頁面${pdf2Images.length > 0 ? ' -> (可能有一段講者串場/休息) -> 接著展示 PDF 2 的頁面' : ''}。
-    ${pdf2Images.length > 0 ?
-      '* 如果提供了 PDF 2，則依序偵測從 PDF 1 切換到 PDF 2 的時間點。' :
-      '* 如果沒有提供 PDF 2，請僅針對 PDF 1 進行分析，忽略任何不屬於 PDF 1 的內容。'}
-    * ${pdf2Images.length > 0 ? 'PDF 1 與 PDF 2 之間**只會發生一次**切換。' : ''}
-    * 在切換期間（例如換檔空檔），若畫面無投影片，請勿產生匹配事件。
+2.  **投影片畫面**：
+    * 投影片可能因拍攝角度、講者遮擋、畫中畫縮小或畫質而不完整，請根據文字標題、圖表形狀、圖片排版判斷。
+    * 若內容相似的頁面有多頁（例如逐步顯示的條列），請選擇與畫面**完全一致**的那一頁。
+    ${isDual ?
+      '* 演講順序是先展示 PDF 1，再展示 PDF 2，兩者之間只會切換一次。' :
+      '* 只有一份簡報，pdfId 固定為 1。若畫面中的投影片不屬於 PDF 1，請視為非投影片畫面。'}
+    ${previousSlide ? `* 前一批候選影格最後對應到的是 ${previousSlide}，可作為順序參考。` : ''}
 
-3.  **視覺匹配優先**：
-    * 請根據畫面中的文字標題、圖表形狀、圖片排版進行比對。
-    * **標題識別**：請優先讀取投影片上方的大字體標題作為 \`slideTitle\`。若無標題，請總結畫面核心內容。
-
-4.  **輸出格式 (JSON)**：
-    請輸出一個 JSON 物件，包含一個 \`transitions\` 陣列。每個元素代表一次「投影片更換事件」。
-    格式要求：
-    * \`timestamp\`: 字串 (${timeFormatLabel})，該投影片**首次**出現的影格時間，請直接使用該影格的 VIDEO_TIMESTAMP 值。
-    * \`pdfId\`: 整數 (${pdf2Images.length > 0 ? '1 或 2' : '固定為 1'})，代表屬於哪一份 PDF。
-    * \`pageNumber\`: 整數，對應的 PDF 頁碼。
-    * \`slideTitle\`: 字串，投影片標題。
-    * \`reasoning\`: 字串 (正體中文)，簡述判斷理由 (例如：「畫面標題與 PDF 1 第 3 頁一致」、「圖表吻合」)。請保持簡短，以避免輸出長度超出 token 上限。
+3.  **輸出格式 (JSON)**：
+    請輸出一個 JSON 物件，包含一個 \`matches\` 陣列，**每一張候選影格都要有一筆**，依編號順序排列。
+    * \`candidateId\`: 字串，候選影格編號（例如 "c12"）。
+    * \`isSlide\`: 布林值，是否為投影片畫面。
+    * \`pdfId\`: 整數 (${isDual ? '1 或 2' : '固定為 1'})，非投影片時填 0。
+    * \`pageNumber\`: 整數，對應的 PDF 頁碼，非投影片時填 0。
+    * \`slideTitle\`: 字串，投影片標題；若無標題請總結畫面核心內容，非投影片時簡述畫面（例如「講者特寫」）。
+    * \`reasoning\`: 字串 (正體中文)，簡述判斷理由，請保持簡短。
     * \`confidence\`: 字串 ("High", "Medium", "Low")。
 """
 `;
@@ -382,19 +604,20 @@ const App = () => {
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            transitions: {
+            matches: {
               type: Type.ARRAY,
               items: {
                 type: Type.OBJECT,
                 properties: {
-                  timestamp: { type: Type.STRING },
+                  candidateId: { type: Type.STRING },
+                  isSlide: { type: Type.BOOLEAN },
                   pdfId: { type: Type.INTEGER },
                   pageNumber: { type: Type.INTEGER },
                   slideTitle: { type: Type.STRING },
                   reasoning: { type: Type.STRING },
                   confidence: { type: Type.STRING, enum: ["High", "Medium", "Low"] }
                 },
-                required: ["timestamp", "pdfId", "pageNumber", "slideTitle", "reasoning", "confidence"]
+                required: ["candidateId", "isSlide", "pdfId", "pageNumber", "slideTitle", "reasoning", "confidence"]
               }
             }
           }
@@ -407,37 +630,11 @@ const App = () => {
       const blockReason = response.promptFeedback?.blockReason;
       const finishReason = response.candidates?.[0]?.finishReason;
       const detail = blockReason ? `（封鎖原因：${blockReason}）` : finishReason ? `（結束原因：${finishReason}）` : '';
-      throw new UserFacingError(`模型回應為空${detail}。可能是內容被安全過濾器攔截，或輸出在產生前就已用盡 token，請稍後再試或縮短影片。`);
+      throw new UserFacingError(`模型回應為空${detail}。可能是內容被安全過濾器攔截，或輸出在產生前就已用盡 token，請稍後再試。`);
     }
 
-    const { transitions: rawTransitions, truncated } = parseTransitionsJson(responseText);
-
-    // --- Midpoint Correction ---
-    // A slide first seen at frame t actually appeared somewhere in (t - interval, t],
-    // so shift back by half the sampling interval (never below 0).
-    // Prefer the exact sampled time of the frame whose label the model returned.
-    const frameTimes = new Map<string, number>();
-    videoFrames.forEach(f => {
-      if (!frameTimes.has(f.timestamp)) frameTimes.set(f.timestamp, f.time);
-    });
-    const correction = interval / 2;
-
-    const transitions: SlideMatch[] = rawTransitions.map((t: any) => {
-      const rawTimestamp = String(t.timestamp ?? '').trim();
-      const detectedSeconds = frameTimes.get(rawTimestamp) ?? parseTimeToSeconds(rawTimestamp);
-      if (!Number.isFinite(detectedSeconds)) {
-        console.warn("Unparseable timestamp from model:", t.timestamp);
-        return { ...t, timestamp: rawTimestamp, seconds: NaN };
-      }
-      const correctedSeconds = Math.max(0, detectedSeconds - correction);
-      return {
-        ...t,
-        seconds: correctedSeconds,
-        timestamp: formatTime(correctedSeconds, useHours),
-      };
-    });
-
-    return { transitions, truncated };
+    const { items, truncated } = parseJsonArrayField(responseText, 'matches');
+    return { matches: items as ModelMatch[], truncated };
   };
 
   // --- Main Handler ---
@@ -449,43 +646,90 @@ const App = () => {
     }
 
     setIsAnalyzing(true);
-    setStatus('正在平行處理檔案（影片與 PDF）...');
+    setStatus('正在處理檔案（影片與 PDF）...');
     setError(null);
     setResults([]);
 
     try {
-      // 1. Performance Optimization: Parallel Processing
-      // Extraction Logic Change: Conditionally extract PDF 2 images
+      // 1. Parallel Processing: PDF rendering and video sampling (reused if the video has not changed)
       const pdf1Promise = extractPdfImages(pdf1File);
       const pdf2Promise = pdf2File ? extractPdfImages(pdf2File) : Promise.resolve([]);
-      const videoPromise = extractVideoFrames(videoFile);
+      const signaturesPromise = currentSignatures
+        ? Promise.resolve(currentSignatures)
+        : sampleVideoSignatures(videoFile, (done, total) => setStatus(`第 1 段：取樣影格 ${done}/${total}...`));
 
-      const [pdf1Images, pdf2Images, video] = await Promise.all([
+      const [pdf1Images, pdf2Images, videoSignatures] = await Promise.all([
         pdf1Promise,
         pdf2Promise,
-        videoPromise
+        signaturesPromise
       ]);
+      setSignatures(videoSignatures);
 
-      if (video.frames.length === 0) {
-        throw new UserFacingError("影格抽取失敗：無法從影片取得任何畫面。請確認影片格式為瀏覽器可播放的 MP4/WebM，且檔案未損壞。");
-      }
       if (pdf1Images.length === 0) {
         throw new UserFacingError("PDF 1 轉換失敗：無法取得任何頁面，請確認檔案未損壞。");
       }
 
-      setStatus(`已抽取：PDF 1 共 ${pdf1Images.length} 頁、PDF 2 共 ${pdf2Images.length} 頁、影片 ${video.frames.length} 張影格。正在以 Gemini 分析...`);
-
-      // 2. Gemini Analysis
-      const { transitions, truncated } = await analyzeWithGemini(pdf1Images, pdf2Images, video);
-
-      setResults(transitions);
-      if (transitions.length === 0) {
-        setStatus(truncated ? '模型回應被截斷，且沒有任何完整的結果。' : '未偵測到任何投影片切換。');
-      } else if (truncated) {
-        setStatus(`分析完成，但模型回應被截斷：已保留前 ${transitions.length} 筆完整結果，最後一筆不完整的資料已捨棄。`);
-      } else {
-        setStatus(`分析完成，共 ${transitions.length} 筆結果。`);
+      // 2. Scene-change detection
+      const useHours = videoSignatures.duration >= 3600;
+      const candidates = detectCandidates(videoSignatures, threshold);
+      if (candidates.length > MAX_CANDIDATES) {
+        throw new UserFacingError(`偵測到 ${candidates.length} 個候選切換點，超過上限 ${MAX_CANDIDATES} 個。請把「切換門檻」調高後再試。`);
       }
+
+      const frames = await captureCandidateFrames(videoFile, candidates, (done, total) =>
+        setStatus(`第 1 段：擷取候選影格 ${done}/${total}...`)
+      );
+      if (frames.length === 0) {
+        throw new UserFacingError("影格抽取失敗：無法擷取任何候選影格，請確認影片檔案完整。");
+      }
+
+      // 3. Gemini matching in batches; candidates missing from a response are retried once
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const queue: { frames: CandidateFrame[]; isRetry: boolean }[] = [];
+      for (let i = 0; i < frames.length; i += BATCH_SIZE) {
+        queue.push({ frames: frames.slice(i, i + BATCH_SIZE), isRetry: false });
+      }
+      const matches = new Map<string, ModelMatch>();
+      let previousSlide: string | null = null;
+
+      for (let b = 0; b < queue.length; b++) {
+        const batch = queue[b];
+        setStatus(`第 2 段：Gemini 比對第 ${b + 1}/${queue.length} 批（${batch.frames.length} 張候選影格）...`);
+        const { matches: batchMatches } = await matchBatchWithGemini(
+          ai, pdf1Images, pdf2Images, batch.frames, useHours, batch.isRetry ? null : previousSlide
+        );
+
+        const batchIds = new Set(batch.frames.map(f => f.id));
+        batchMatches.forEach(m => {
+          if (m && batchIds.has(m.candidateId)) matches.set(m.candidateId, m);
+        });
+
+        const missing = batch.frames.filter(f => !matches.has(f.id));
+        if (missing.length > 0 && !batch.isRetry) {
+          console.warn(`Batch ${b + 1}: ${missing.length} candidates missing from response, retrying`);
+          queue.push({ frames: missing, isRetry: true });
+        }
+        if (!batch.isRetry) {
+          const lastSlide = [...batch.frames].reverse().map(f => matches.get(f.id)).find(m => m?.isSlide);
+          if (lastSlide) previousSlide = `PDF ${lastSlide.pdfId} 第 ${lastSlide.pageNumber} 頁`;
+        }
+      }
+
+      // 4. Post-processing
+      const { results: finalResults, nonSlideCount } = buildResults(frames, matches, pdf1Images, pdf2Images, useHours);
+      const unmatchedCount = frames.filter(f => !matches.has(f.id)).length;
+      const flaggedCount = finalResults.filter(r => r.flagged).length;
+
+      setResults(finalResults);
+      const summary = [
+        `候選影格 ${frames.length} 張`,
+        `非投影片 ${nonSlideCount} 張`,
+        flaggedCount > 0 ? `${flaggedCount} 筆標記為待確認` : '',
+        unmatchedCount > 0 ? `${unmatchedCount} 張模型未回傳判斷` : '',
+      ].filter(Boolean).join('、');
+      setStatus(finalResults.length > 0
+        ? `分析完成，共 ${finalResults.length} 筆投影片事件（${summary}）。`
+        : `未偵測到任何投影片（${summary}）。`);
 
     } catch (err) {
       console.error(err);
@@ -497,10 +741,10 @@ const App = () => {
   };
 
   return (
-    <div className="p-8 max-w-5xl mx-auto font-sans">
+    <div className="p-8 max-w-6xl mx-auto font-sans">
       <h1 className="text-3xl font-bold mb-6 text-gray-800">影片投影片分析工具（單份或雙份簡報）</h1>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         <div className="p-4 bg-blue-50 rounded-lg border border-blue-100">
           <label className="block text-sm font-semibold text-blue-900 mb-2">1. 影片檔案（MP4/WebM）</label>
           <input
@@ -530,6 +774,30 @@ const App = () => {
             className="w-full text-sm text-gray-700"
           />
         </div>
+      </div>
+
+      <div className="mb-8 p-4 bg-gray-50 rounded-lg border border-gray-200">
+        <label htmlFor="threshold" className="flex justify-between text-sm font-semibold text-gray-800 mb-2">
+          <span>切換門檻（相鄰畫面平均像素差）</span>
+          <span className="font-mono">{threshold.toFixed(1)}%</span>
+        </label>
+        <input
+          id="threshold"
+          type="range"
+          min={MIN_DIFF_THRESHOLD}
+          max={MAX_DIFF_THRESHOLD}
+          step={0.5}
+          value={threshold}
+          disabled={isAnalyzing}
+          onChange={(e) => setThreshold(Number(e.target.value))}
+          className="w-full"
+        />
+        <p className="mt-2 text-xs text-gray-600">
+          數值越低越敏感：候選影格越多、較不會漏頁，但 Gemini 費用較高；數值越高越可能漏掉內容相近的投影片。預設 {DEFAULT_DIFF_THRESHOLD}%。
+          {candidateCount !== null && (
+            <span className="ml-1 font-semibold text-gray-800">目前門檻下有 {candidateCount} 個候選切換點。</span>
+          )}
+        </p>
       </div>
 
       <div className="mb-8 text-center">
@@ -564,11 +832,13 @@ const App = () => {
       )}
 
       {results.length > 0 && (
-        <div className="bg-white rounded-xl shadow-md overflow-hidden border border-gray-200">
+        <div className="bg-white rounded-xl shadow-md overflow-x-auto border border-gray-200">
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="bg-gray-100 text-gray-700 text-sm uppercase tracking-wider">
                 <th className="p-4 border-b">時間</th>
+                <th className="p-4 border-b">候選影格</th>
+                <th className="p-4 border-b">對應頁面</th>
                 <th className="p-4 border-b">來源</th>
                 <th className="p-4 border-b">頁碼</th>
                 <th className="p-4 border-b">標題／摘要</th>
@@ -578,20 +848,43 @@ const App = () => {
             </thead>
             <tbody>
               {results.map((match, index) => (
-                <tr key={index} className="hover:bg-gray-50 border-b last:border-0 transition-colors">
+                <tr
+                  key={index}
+                  className={`border-b last:border-0 transition-colors ${
+                    match.flagged ? 'bg-yellow-50 hover:bg-yellow-100' : 'hover:bg-gray-50'
+                  }`}
+                >
                   <td className="p-4">
                     <button
                       onClick={() => jumpToTime(match.seconds)}
-                      disabled={!Number.isFinite(match.seconds)}
                       title="跳到影片此時間點並播放"
-                      className="inline-flex items-center gap-1 px-3 py-1 rounded-lg font-mono font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 disabled:text-gray-400 disabled:bg-gray-100 disabled:cursor-not-allowed transition-colors"
+                      className="inline-flex items-center gap-1 px-3 py-1 rounded-lg font-mono font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 transition-colors"
                     >
                       <span aria-hidden="true">▶</span>
                       {match.timestamp}
                     </button>
                   </td>
                   <td className="p-4">
-                    <span className={`px-2 py-1 rounded text-xs font-bold ${
+                    <button
+                      onClick={() => jumpToTime(match.frameSeconds)}
+                      title={`跳到代表影格 ${match.frameTimestamp}`}
+                      className="block"
+                    >
+                      <img src={match.thumbnail} alt={`候選影格 ${match.frameTimestamp}`} className="w-32 rounded border border-gray-300" />
+                      <span className="block mt-1 text-xs text-gray-500 font-mono">
+                        {match.frameTimestamp}{match.mergedCount > 1 ? `（合併 ${match.mergedCount} 張）` : ''}
+                      </span>
+                    </button>
+                  </td>
+                  <td className="p-4">
+                    {match.pdfThumbnail ? (
+                      <img src={match.pdfThumbnail} alt={`PDF ${match.pdfId} 第 ${match.pageNumber} 頁`} className="w-32 rounded border border-gray-300" />
+                    ) : (
+                      <span className="text-xs text-gray-400">無預覽</span>
+                    )}
+                  </td>
+                  <td className="p-4">
+                    <span className={`px-2 py-1 rounded text-xs font-bold whitespace-nowrap ${
                       match.pdfId === 1 ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'
                     }`}>
                       PDF {match.pdfId}
